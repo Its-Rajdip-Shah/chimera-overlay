@@ -1,217 +1,115 @@
 // content.js
-// After Safari Translate -> Simplified Chinese, this script:
-// - detects Hanzi runs in text nodes
-// - replaces each run with pinyin fetched from localhost server via background.js
-// - hover tooltip shows original Hanzi + pinyin
-// - mutation observer keeps it updated
+const EXT_CONTENT_VERSION = "chimera-content-2026-02-09-dblclick-01";
+
 (() => {
-  const SKIP_TAGS = new Set(["SCRIPT", "STYLE", "TEXTAREA", "INPUT", "CODE", "PRE", "NOSCRIPT"]);
+  console.log("✅ Chimera dblclick dictionary loaded:", EXT_CONTENT_VERSION);
 
-  // Hanzi range (CJK Unified Ideographs). Good enough for Simplified pages.
-  const HANZI_REGEX = /[\u4E00-\u9FFF]/;
+  // Popup UI
+  const popup = document.createElement("div");
+  Object.assign(popup.style, {
+    position: "fixed",
+    zIndex: "2147483647",
+    background: "rgba(20,20,20,0.95)",
+    color: "white",
+    padding: "12px 14px",
+    borderRadius: "12px",
+    maxWidth: "560px",
+    fontSize: "14px",
+    lineHeight: "1.4",
+    boxShadow: "0 10px 30px rgba(0,0,0,0.35)",
+    display: "none",
+    whiteSpace: "pre-line",
+  });
+  document.documentElement.appendChild(popup);
 
-  // Match continuous runs of Hanzi (so we can convert chunk-by-chunk)
-  const HANZI_RUN_REGEX = /[\u4E00-\u9FFF]+/g;
-
-  // Cache in content script too (avoids roundtrips even to background)
-  const localCache = new Map();
-  const MAX_LOCAL_CACHE = 5000;
-
-  function localCacheSet(key, value) {
-    if (localCache.size >= MAX_LOCAL_CACHE) {
-      const oldestKey = localCache.keys().next().value;
-      localCache.delete(oldestKey);
-    }
-    localCache.set(key, value);
+  function esc(s) {
+    return String(s || "").replace(/[&<>"]/g, c => (
+      c === "&" ? "&amp;" : c === "<" ? "&lt;" : c === ">" ? "&gt;" : "&quot;"
+    ));
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // Tooltip UI (shows ONLY: original Hanzi + pinyin)
-  // ─────────────────────────────────────────────────────────────
-  const tip = document.createElement("div");
-  tip.id = "chimera-tip";
-  tip.style.position = "fixed";
-  tip.style.zIndex = "2147483647";
-  tip.style.pointerEvents = "none";
-  tip.style.padding = "8px 10px";
-  tip.style.borderRadius = "10px";
-  tip.style.fontSize = "13px";
-  tip.style.lineHeight = "1.25";
-  tip.style.boxShadow = "0 6px 20px rgba(0,0,0,0.25)";
-  tip.style.background = "rgba(20,20,20,0.95)";
-  tip.style.color = "white";
-  tip.style.maxWidth = "360px";
-  tip.style.whiteSpace = "pre-line";
-  tip.style.display = "none";
-  document.documentElement.appendChild(tip);
-
-  function showTip(hanzi, pinyin, x, y) {
-    tip.textContent = `Hanzi: ${hanzi}\nPinyin: ${pinyin}`;
-    tip.style.display = "block";
-    const left = Math.min(x + 12, window.innerWidth - 380);
-    const top = Math.min(y + 12, window.innerHeight - 140);
-    tip.style.left = `${left}px`;
-    tip.style.top = `${top}px`;
+  function showAt(html, x, y) {
+    popup.innerHTML = html;
+    popup.style.left = `${Math.min(x + 12, window.innerWidth - 600)}px`;
+    popup.style.top = `${Math.min(y + 12, window.innerHeight - 340)}px`;
+    popup.style.display = "block";
   }
 
-  function hideTip() {
-    tip.style.display = "none";
+  function hide() { popup.style.display = "none"; }
+
+  document.addEventListener("click", hide, true);
+  window.addEventListener("scroll", hide, true);
+  window.addEventListener("keydown", (e) => { if (e.key === "Escape") hide(); }, true);
+
+  // Prevent noisy lookups: trim punctuation
+  function cleanSelection(s) {
+    s = (s || "").trim();
+    s = s.replace(/\s+/g, " ");
+    // remove wrapping quotes/punct
+    s = s.replace(/^[“”"'\(\)\[\]\{\},.!?;:]+/, "");
+    s = s.replace(/[“”"'\(\)\[\]\{\},.!?;:]+$/, "");
+    return s.trim();
   }
 
-  window.addEventListener("scroll", hideTip, true);
-  document.addEventListener("click", hideTip, true);
+  // Cache results in-page
+  const cache = new Map();
+  const MAX_CACHE = 1000;
+  function cacheSet(k, v) {
+    if (cache.size >= MAX_CACHE) cache.delete(cache.keys().next().value);
+    cache.set(k, v);
+  }
 
-  // ─────────────────────────────────────────────────────────────
-  // Background proxy call
-  // ─────────────────────────────────────────────────────────────
-  function getPinyinFromServer(text) {
-    const cached = localCache.get(text);
-    if (cached !== undefined) return Promise.resolve(cached);
+  async function lookup(text) {
+    if (cache.has(text)) return cache.get(text);
 
-    return new Promise((resolve, reject) => {
-      chrome.runtime.sendMessage({ type: "CHIMERA_PINYIN", text }, (resp) => {
-        if (!resp || !resp.ok) return reject(resp?.error || "No response from background");
-        localCacheSet(text, resp.pinyin || "");
-        resolve(resp.pinyin || "");
-      });
+    const resp = await new Promise((resolve) => {
+      chrome.runtime.sendMessage({ type: "DICT_LOOKUP", text }, resolve);
     });
+
+    if (!resp || !resp.ok) throw new Error(resp?.error || "No response from background");
+    if (!resp.data || !resp.data.ok) throw new Error(resp?.data?.error || "Server returned error");
+
+    cacheSet(text, resp.data.data);
+    return resp.data.data;
   }
 
-  // ─────────────────────────────────────────────────────────────
-  // Replace Hanzi runs in a text node with pinyin spans
-  // ─────────────────────────────────────────────────────────────
-  async function replaceTextNode(textNode) {
-    const text = textNode.nodeValue;
-    if (!text || !HANZI_REGEX.test(text)) return;
+  document.addEventListener("dblclick", async (e) => {
+    const raw = window.getSelection().toString();
+    const sel = cleanSelection(raw);
+    if (!sel) return;
+    if (sel.length > 120) return;
 
-    // Avoid reprocessing nodes inside our output spans
-    const parentEl = textNode.parentNode;
-    if (!parentEl) return;
-    if (parentEl.nodeType === Node.ELEMENT_NODE) {
-      const pel = parentEl;
-      if (pel.closest && pel.closest("span[data-chimera='1']")) return;
+    showAt(`Looking up…<br><span style="opacity:.7">${esc(sel)}</span>`, e.clientX, e.clientY);
+
+    try {
+      const d = await lookup(sel);
+
+      const examples = Array.isArray(d.examples) ? d.examples.slice(0, 2) : [];
+      const exHtml = examples.map((ex, i) => {
+        const py = esc(ex.pinyin || "");
+        const en = esc(ex.english || "");
+        return `<b>Example ${i + 1}</b><br>${py}<br><span style="opacity:.85">${en}</span>`;
+      }).join("<br><br>");
+
+      showAt(
+        `<b>${esc(d.pinyin || "")}</b><br>` +
+        `<span style="opacity:.9">${esc(d.english || "")}</span>` +
+        `<br><br><b>How it’s used</b><br>${esc(d.usage || "")}` +
+        (exHtml ? `<br><br>${exHtml}` : ""),
+        e.clientX,
+        e.clientY
+      );
+    } catch (err) {
+      showAt(
+        `Lookup failed.<br><span style="opacity:.8">${esc(String(err?.message || err))}</span>`,
+        e.clientX,
+        e.clientY
+      );
     }
+  }, true);
 
-    // Build fragment with mixed plain text and pinyin spans
-    const frag = document.createDocumentFragment();
-    let lastIndex = 0;
-
-    // Reset regex state
-    HANZI_RUN_REGEX.lastIndex = 0;
-
-    let match;
-    while ((match = HANZI_RUN_REGEX.exec(text)) !== null) {
-      const hanzi = match[0];
-      const start = match.index;
-      const end = start + hanzi.length;
-
-      // Append text before the Hanzi run
-      if (start > lastIndex) {
-        frag.appendChild(document.createTextNode(text.slice(lastIndex, start)));
-      }
-
-      // Convert this Hanzi run to pinyin (cached)
-      let py = "";
-      try {
-        py = await getPinyinFromServer(hanzi);
-      } catch (e) {
-        // If server fails, fall back to leaving Hanzi unchanged
-        py = hanzi;
-      }
-
-      const span = document.createElement("span");
-      span.dataset.chimera = "1";
-      span.dataset.hanzi = hanzi;
-      span.dataset.pinyin = py;
-
-      // Display pinyin on page
-      span.textContent = py;
-
-      // Style: subtle dotted underline so user knows it's hoverable
-      span.style.cursor = "help";
-      span.style.textDecoration = "underline dotted";
-
-      // Hover tooltip
-      span.addEventListener("mouseenter", (e) => showTip(hanzi, py, e.clientX, e.clientY));
-      span.addEventListener("mousemove", (e) => showTip(hanzi, py, e.clientX, e.clientY));
-      span.addEventListener("mouseleave", hideTip);
-
-      frag.appendChild(span);
-
-      lastIndex = end;
-    }
-
-    // Append remaining text after last match
-    if (lastIndex < text.length) {
-      frag.appendChild(document.createTextNode(text.slice(lastIndex)));
-    }
-
-    // Swap node
-    textNode.parentNode.replaceChild(frag, textNode);
-  }
-
-  function shouldSkipElement(el) {
-    if (!el || el.nodeType !== Node.ELEMENT_NODE) return false;
-    if (SKIP_TAGS.has(el.tagName)) return true;
-    if (el.tagName === "SPAN" && el.dataset && el.dataset.chimera === "1") return true;
-    return false;
-  }
-
-  function walk(node, tasks) {
-    if (!node) return;
-
-    if (node.nodeType === Node.ELEMENT_NODE) {
-      const el = node;
-      if (shouldSkipElement(el)) return;
-      // Traverse children
-      for (const child of Array.from(el.childNodes)) walk(child, tasks);
-      return;
-    }
-
-    if (node.nodeType === Node.TEXT_NODE) {
-      tasks.push(node);
-    }
-  }
-
-  // Debounced processing
-  let scheduled = false;
-  function scheduleProcess() {
-    if (scheduled) return;
-    scheduled = true;
-    setTimeout(async () => {
-      scheduled = false;
-      await processPage();
-    }, 250);
-  }
-
-  async function processPage() {
-    const tasks = [];
-    walk(document.body, tasks);
-
-    // Process sequentially to avoid hammering localhost
-    // (You can parallelize later with a small concurrency limit)
-    for (const tn of tasks) {
-      // node might have been replaced already
-      if (!tn.parentNode) continue;
-      await replaceTextNode(tn);
-    }
-  }
-
-  // Observe DOM changes (Safari Translate often triggers mutations)
-  const observer = new MutationObserver((mutations) => {
-    // If new text nodes appear or structure changes, re-run
-    // Keep it cheap: just schedule a debounced pass
-    scheduleProcess();
-  });
-
-  observer.observe(document.documentElement, {
-    childList: true,
-    subtree: true,
-    characterData: true
-  });
-
-  // Initial run
-  processPage().then(() => {
-    console.log("✅ Chimera: pinyin overlay active on", location.href);
+  // Optional: quick debug check in console
+  chrome.runtime.sendMessage({ type: "DICT_VERSION" }, (resp) => {
+    if (resp?.ok) console.log("✅ Chimera server version:", resp.data);
   });
 })();

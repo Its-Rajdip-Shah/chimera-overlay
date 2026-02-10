@@ -1,14 +1,193 @@
-# uvicorn server:app --host 127.0.0.1 --port 8787
+# server.py
+# Run:
+#   uvicorn server:app --host 127.0.0.1 --port 8787 --reload
 
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel
-import re
-import jieba
-from pypinyin import pinyin, Style
+import os, re, time, json
+from collections import OrderedDict
+from typing import Dict, List, Optional, Tuple
+import urllib.request
 
+APP_VERSION = "chimera-server-2026-02-09-fast-cedict-cache-01"
+BASE_DIR = os.path.dirname(os.path.abspath(__file__))
+CEDICT_PATH = os.path.join(BASE_DIR, "cedict_ts.u8")
+
+OLLAMA_URL = "http://127.0.0.1:11434/api/generate"
+OLLAMA_MODEL = "qwen2.5:7b-instruct"
+
+# ───────── No-Hanzi hard ban ─────────
+HANZI_RE = re.compile(r"[\u4E00-\u9FFF]")
+def strip_hanzi(s: str) -> str:
+    return HANZI_RE.sub("", s or "")
+def strip_hanzi_deep(obj):
+    if isinstance(obj, str): return strip_hanzi(obj)
+    if isinstance(obj, list): return [strip_hanzi_deep(x) for x in obj]
+    if isinstance(obj, dict): return {k: strip_hanzi_deep(v) for k, v in obj.items()}
+    return obj
+
+# ───────── Simple LRU cache ─────────
+class LRU:
+    def __init__(self, maxsize=1500):
+        self.maxsize = maxsize
+        self.d = OrderedDict()
+
+    def get(self, k):
+        if k in self.d:
+            self.d.move_to_end(k)
+            return self.d[k]
+        return None
+
+    def set(self, k, v):
+        self.d[k] = v
+        self.d.move_to_end(k)
+        if len(self.d) > self.maxsize:
+            self.d.popitem(last=False)
+
+CACHE = LRU(maxsize=2000)
+
+# ───────── CC-CEDICT load (pinyin_num -> defs) ─────────
+CEDICT_LINE_RE = re.compile(r"^(\S+)\s+(\S+)\s+\[([^\]]+)\]\s+/(.+)/\s*$")
+PINYIN_INDEX: Dict[str, List[str]] = {}
+
+def clean_defs(defs: str) -> str:
+    s = defs.replace("/", "; ")
+    s = re.sub(r"\s{2,}", " ", s).strip(" ;")
+    # shorten mega-def spam a bit
+    s = s[:350]
+    return s
+
+def load_cedict():
+    if not os.path.exists(CEDICT_PATH):
+        # Still allow server to run for English-only mode
+        return
+    with open(CEDICT_PATH, "r", encoding="utf-8") as f:
+        for line in f:
+            line = line.strip()
+            if not line or line.startswith("#"):
+                continue
+            m = CEDICT_LINE_RE.match(line)
+            if not m:
+                continue
+            pinyin_num = m.group(3).strip().lower()
+            defs = clean_defs(m.group(4).strip())
+            PINYIN_INDEX.setdefault(pinyin_num, []).append(defs)
+
+load_cedict()
+
+# ───────── Pinyin detection ─────────
+TONE_MARK_RE = re.compile(r"[āáǎàēéěèīíǐìōóǒòūúǔùǖǘǚǜńňǹ]")
+PINYIN_ALLOWED_RE = re.compile(r"^[a-zA-ZüÜvV0-9\s\-]+$")
+
+def is_pinyinish(text: str) -> bool:
+    if not text: return False
+    if HANZI_RE.search(text): return False
+    t = text.strip()
+    return bool(TONE_MARK_RE.search(t) or re.search(r"\d", t) or "ü" in t.lower() or "v" in t.lower())
+
+# tone-mark -> tone-number conversion (for cedict keys)
+TONE_MAP = {
+    "ā": ("a","1"),"á": ("a","2"),"ǎ": ("a","3"),"à": ("a","4"),
+    "ē": ("e","1"),"é": ("e","2"),"ě": ("e","3"),"è": ("e","4"),
+    "ī": ("i","1"),"í": ("i","2"),"ǐ": ("i","3"),"ì": ("i","4"),
+    "ō": ("o","1"),"ó": ("o","2"),"ǒ": ("o","3"),"ò": ("o","4"),
+    "ū": ("u","1"),"ú": ("u","2"),"ǔ": ("u","3"),"ù": ("u","4"),
+    "ǖ": ("ü","1"),"ǘ": ("ü","2"),"ǚ": ("ü","3"),"ǜ": ("ü","4"),
+    "ń": ("n","2"),"ň": ("n","3"),"ǹ": ("n","4"),
+}
+
+def normalize_pinyin_to_num(text: str) -> Optional[str]:
+    s = (text or "").strip()
+    if not s: return None
+    if HANZI_RE.search(s): return None
+    s = s.lower().replace("v","ü").replace("u:","ü")
+
+    if not PINYIN_ALLOWED_RE.match(s) and not TONE_MARK_RE.search(s):
+        return None
+
+    # already tone numbers
+    if re.search(r"\d", s):
+        s2 = re.sub(r"[\-]", " ", s)
+        s2 = re.sub(r"\s+", " ", s2).strip()
+        return s2
+
+    out = []
+    pending = None
+    for ch in s:
+        if ch in TONE_MAP:
+            base, tone = TONE_MAP[ch]
+            out.append(base)
+            pending = tone
+        else:
+            if ch in [" ","-"]:
+                if pending:
+                    out.append(pending); pending=None
+                out.append(" ")
+            else:
+                out.append(ch)
+    if pending: out.append(pending)
+    s2 = "".join(out)
+    s2 = re.sub(r"\s+"," ", s2).strip()
+    return s2
+
+def cedict_lookup(pinyin_num: str) -> Tuple[str,int]:
+    """Returns (best_def, alt_count)."""
+    if not PINYIN_INDEX:
+        return ("", 0)
+    k = (pinyin_num or "").strip().lower()
+    if not k:
+        return ("", 0)
+
+    defs = PINYIN_INDEX.get(k)
+    if not defs:
+        fused = k.replace(" ","")
+        defs = PINYIN_INDEX.get(fused)
+    if not defs and " " not in k:
+        spaced = re.sub(r"(\d)([a-zü])", r"\1 \2", k)
+        spaced = re.sub(r"\s+"," ", spaced).strip()
+        defs = PINYIN_INDEX.get(spaced)
+
+    if not defs:
+        return ("", 0)
+    return (defs[0], max(0, len(defs)-1))
+
+# ───────── Ollama call (keep alive + shorter outputs) ─────────
+def ollama_generate(prompt: str) -> str:
+    payload = {
+        "model": OLLAMA_MODEL,
+        "prompt": prompt,
+        "stream": False,
+        "keep_alive": "10m",          # keeps model hot
+        "options": {
+            "temperature": 0.25,
+            "top_p": 0.9,
+            "num_predict": 180,        # cap output => faster
+        }
+    }
+    data = json.dumps(payload).encode("utf-8")
+    req = urllib.request.Request(
+        OLLAMA_URL, data=data,
+        headers={"Content-Type":"application/json"},
+        method="POST"
+    )
+    with urllib.request.urlopen(req, timeout=90) as resp:
+        j = json.loads(resp.read().decode("utf-8", errors="replace"))
+        return j.get("response","") or ""
+
+def parse_json_obj(text: str) -> Optional[dict]:
+    t = (text or "").strip()
+    if t.startswith("{") and t.endswith("}"):
+        try: return json.loads(t)
+        except: pass
+    a = t.find("{"); b = t.rfind("}")
+    if a != -1 and b != -1 and b > a:
+        try: return json.loads(t[a:b+1])
+        except: return None
+    return None
+
+# ───────── FastAPI ─────────
 app = FastAPI()
-
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -17,90 +196,81 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-class PinyinReq(BaseModel):
+class LookupReq(BaseModel):
     text: str
 
-# Phrase overrides (tone-mark pinyin)
-PHRASE_OVERRIDES = {
-    "银行": "yín háng",
-    "行业": "háng yè",
-    "重新": "chóng xīn",
-    "觉得": "jué de",
-    "普通话": "pǔ tōng huà",
-    "官话": "guān huà",
-    "标准汉语": "biāo zhǔn hàn yǔ",
-    "汉语": "hàn yǔ",
-    "华北平原": "huá běi píng yuán",
-    "长江": "cháng jiāng",
-    "黑龙江": "hēi lóng jiāng",
-    "新疆": "xīn jiāng",
-    "云南": "yún nán",
-    "北京": "běi jīng",
-}
+@app.get("/version")
+def version():
+    return {"ok": True, "version": APP_VERSION, "time": int(time.time()), "model": OLLAMA_MODEL}
 
-# Optional: teach jieba some domain words so it segments nicely
-for w in PHRASE_OVERRIDES.keys():
-    jieba.add_word(w)
+@app.post("/lookup")
+def lookup(req: LookupReq):
+    raw = (req.text or "").strip()
+    raw = raw.replace("\n"," ").strip()
+    raw = raw[:120]
+    if not raw:
+        return {"ok": False, "error": "Empty selection."}
 
-# Punctuation tightening (so you don't get weird spaces)
-PUNCT = r"([，。！？；：、,.!?;:])"
-CLOSE_PUNCT = r"([）)】\]”’\"'])"
-OPEN_PUNCT = r"([（(【\[\“‘\"'])"
+    cache_key = raw.lower()
+    cached = CACHE.get(cache_key)
+    if cached is not None:
+        return {"ok": True, "data": cached, "cached": True}
 
-def tighten_punctuation(s: str) -> str:
-    # remove spaces before punctuation
-    s = re.sub(r"\s+" + PUNCT, r"\1", s)
-    # remove spaces before closing punctuation
-    s = re.sub(r"\s+" + CLOSE_PUNCT, r"\1", s)
-    # remove spaces after opening punctuation
-    s = re.sub(OPEN_PUNCT + r"\s+", r"\1", s)
-    # collapse multiple spaces
-    s = re.sub(r"[ \t]{2,}", " ", s)
-    return s.strip()
+    # ✅ FAST PATH: pinyin => CC-CEDICT only (instant)
+    if is_pinyinish(raw):
+        pnum = normalize_pinyin_to_num(raw) or ""
+        best_def, alt = cedict_lookup(pnum)
+        if best_def:
+            data = strip_hanzi_deep({
+                "selection": raw,
+                "selection_type": "pinyin",
+                "pinyin": raw,                  # keep user’s tone marks if they selected them
+                "english": best_def,
+                "usage": "Quick dictionary meaning from CC-CEDICT. If you want deeper nuance, we can add an LLM ‘deep mode’ later.",
+                "examples": []
+            })
+            CACHE.set(cache_key, data)
+            return {"ok": True, "data": data, "cached": False, "source": "cedict", "alt_senses": alt}
 
-def apply_overrides_longest_first(text: str) -> str:
-    # Replace longer phrases first to avoid partial replacement issues
-    for k in sorted(PHRASE_OVERRIDES.keys(), key=len, reverse=True):
-        text = text.replace(k, f"⟦{PHRASE_OVERRIDES[k]}⟧")  # mark as protected
-    return text
+        # if cedict misses, fall through to LLM
 
-def restore_overrides(tokens: list[str]) -> list[str]:
-    out = []
-    for t in tokens:
-        if t.startswith("⟦") and t.endswith("⟧"):
-            out.append(t[1:-1])  # drop the brackets, keep pinyin
-        else:
-            out.append(t)
-    return out
+    # LLM path (slower, but cached)
+    prompt = f"""
+You are a Mandarin speaking/listening coach.
 
-def hanzi_to_pinyin(text: str) -> str:
-    # Preserve newlines by processing per line
-    lines = text.splitlines()
-    out_lines = []
+User selected text: "{raw}"
 
-    for line in lines:
-        if not line.strip():
-            out_lines.append("")  # keep blank lines
-            continue
+CRITICAL:
+- Output JSON ONLY.
+- Do NOT output any Hanzi/Chinese characters at all.
+- Mandarin must be in pinyin with tone marks.
 
-        line2 = apply_overrides_longest_first(line)
-        words = jieba.lcut(line2, cut_all=False)
+Return this exact schema:
+{{
+  "selection": string,
+  "selection_type": "pinyin" | "english",
+  "pinyin": string,
+  "english": string,
+  "usage": string,
+  "examples": [
+    {{"pinyin": string, "english": string}},
+    {{"pinyin": string, "english": string}}
+  ]
+}}
 
-        out = []
-        for w in words:
-            # If it's an override marker, keep as-is
-            if w.startswith("⟦") and w.endswith("⟧"):
-                out.append(w[1:-1])
-                continue
+Keep it short.
+Now output JSON:
+"""
+    out = ollama_generate(prompt)
+    obj = parse_json_obj(out) or {
+        "selection": raw,
+        "selection_type": "english",
+        "pinyin": "",
+        "english": "Model output parse failed.",
+        "usage": "Try selecting a single word.",
+        "examples": []
+    }
 
-            py = pinyin(w, style=Style.TONE, errors=lambda x: [x])
-            out.append(" ".join(s[0] for s in py))
-
-        out = restore_overrides(out)
-        out_lines.append(tighten_punctuation(" ".join(out)))
-
-    return "\n".join(out_lines).strip()
-
-@app.post("/pinyin")
-def pinyin_endpoint(req: PinyinReq):
-    return {"pinyin": hanzi_to_pinyin(req.text)}
+    obj = strip_hanzi_deep(obj)
+    CACHE.set(cache_key, obj)
+    return {"ok": True, "data": obj, "cached": False, "source": "llm"}
